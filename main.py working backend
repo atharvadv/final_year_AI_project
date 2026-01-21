@@ -1,0 +1,93 @@
+import os
+import shutil
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional # <--- Added this
+
+# --- IMPORTS ---
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import FastEmbedEmbeddings
+from langchain_community.chat_models import ChatOllama
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+
+# --- CONFIGURATION ---
+DB_FOLDER = "./db"
+FILES_DIR = "./uploaded_files"
+os.makedirs(FILES_DIR, exist_ok=True)
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+embed_model = FastEmbedEmbeddings()
+llm = ChatOllama(model="tinyllama")
+
+class QuestionRequest(BaseModel):
+    query: str
+    filter_filename: Optional[str] = None # <--- New Filter Field
+
+@app.post("/upload")
+async def upload_document(file: UploadFile = File(...)):
+    file_path = os.path.join(FILES_DIR, file.filename)
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    loader = PyPDFLoader(file_path)
+    docs = loader.load_and_split()
+    
+    # We explicitly add the filename to metadata so we can search for it later
+    for doc in docs:
+        doc.metadata["filename"] = file.filename
+
+    Chroma.from_documents(docs, embed_model, persist_directory=DB_FOLDER)
+    
+    return {"status": "success", "filename": file.filename}
+
+@app.get("/files")
+async def get_files():
+    if not os.path.exists(FILES_DIR):
+        return []
+    return os.listdir(FILES_DIR)
+
+@app.post("/ask")
+async def ask_question(request: QuestionRequest):
+    # 1. Setup Database
+    db = Chroma(persist_directory=DB_FOLDER, embedding_function=embed_model)
+    
+    # 2. Apply Filter if a subject is selected
+    search_kwargs = {}
+    if request.filter_filename:
+        # This tells the DB: "Only look at vectors that match this filename"
+        search_kwargs = {"filter": {"filename": request.filter_filename}}
+        print(f"Filtering by: {request.filter_filename}")
+
+    retriever = db.as_retriever(search_kwargs=search_kwargs)
+    
+    # 3. Define Prompt
+    template = """
+    You are a strict professor. Answer ONLY based on the context below.
+    If the answer is not in the context, say "This is outside the syllabus."
+    
+    Context: {context}
+    Question: {question}
+    """
+    prompt = PromptTemplate.from_template(template)
+    
+    chain = (
+        {"context": retriever, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    
+    result = chain.invoke(request.query)
+    return {"answer": result}
