@@ -1,0 +1,93 @@
+import os
+import shutil
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
+
+# --- IMPORTS ---
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import FastEmbedEmbeddings
+from langchain_community.chat_models import ChatOllama
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+
+# --- CONFIGURATION ---
+DB_FOLDER = "./db"
+FILES_DIR = "./uploaded_files"
+os.makedirs(FILES_DIR, exist_ok=True)
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize AI - Using the fastest lightweight model
+embed_model = FastEmbedEmbeddings()
+llm = ChatOllama(model="tinyllama", temperature=0) # Temperature 0 = Faster, more direct
+
+class QuestionRequest(BaseModel):
+    query: str
+    filter_filename: Optional[str] = None 
+
+@app.post("/upload")
+async def upload_document(file: UploadFile = File(...)):
+    file_path = os.path.join(FILES_DIR, file.filename)
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    loader = PyPDFLoader(file_path)
+    docs = loader.load_and_split()
+    
+    for doc in docs:
+        doc.metadata["filename"] = file.filename
+
+    Chroma.from_documents(docs, embed_model, persist_directory=DB_FOLDER)
+    return {"status": "success", "filename": file.filename}
+
+@app.get("/files")
+async def get_files():
+    if not os.path.exists(FILES_DIR):
+        return []
+    return os.listdir(FILES_DIR)
+
+@app.post("/ask")
+async def ask_question(request: QuestionRequest):
+    db = Chroma(persist_directory=DB_FOLDER, embedding_function=embed_model)
+    
+    # PERFORMANCE HACK 1: Only retrieve the ONE best match (k=1)
+    # This prevents the AI from reading too much text, which causes lag.
+    search_kwargs = {"k": 1}
+    
+    if request.filter_filename:
+        search_kwargs["filter"] = {"filename": request.filter_filename}
+
+    retriever = db.as_retriever(search_kwargs=search_kwargs)
+    
+    # PERFORMANCE HACK 2: The "Speed Prompt"
+    # We explicitly tell the AI to be short. Less text to generate = Faster response.
+    template = """
+    You are a helpful assistant. Answer the question based ONLY on the following context.
+    Keep your answer extremely concise (maximum 2 sentences).
+    
+    Context: {context}
+    
+    Question: {question}
+    """
+    prompt = PromptTemplate.from_template(template)
+    
+    chain = (
+        {"context": retriever, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    
+    result = chain.invoke(request.query)
+    return {"answer": result}
